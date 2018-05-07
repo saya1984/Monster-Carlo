@@ -1,0 +1,179 @@
+Integrating MonsterCarlo with 2D Roguelike
+
+2D Roguelike is an open source Unity game featured in a series of tutorials here: https://www.youtube.com/watch?v=Fdcnt2-Jf4w 
+
+The MC_support.cs needed to be added under Assets/Scripts and added as a component to the GameManager prefab. 
+For simplicity, I added a namualPlay switch to the GameManager prefab to differentiate between the builds meant for machine testing or human play.
+In the Awake function, the GameManager, if manualPlay is false, we call mcSupport.Connect() and get the designVariant. For this integration, our options are flat or factored actions. We’re also setting the Application’s runInBackground to true, setting the targetFrameRate to -1 and setting the QualitySettings.vSyncCount to 0.
+
+We came up with a custom reward function for the game, which is the sum of the amount of food the player had at the end of each day plus the distance traveled toward the exit on the day of death. We added helper properties and functions to keep track of this score.
+We added a method for resetting the game. This is called when the GameOver condition is triggered. The final reward score is sent to the MC_support and the game is reset, so it can be played again. 
+
+The user input is handled inside Player.cs. Since MC_support will be calling the shots on this one, we check for the manualPlay condition inside the Update() method. At any point, the player can go in one of the four directions. If we want to simply choose one at random, i.e. flat actions approach, we call MC_support.choose(4) to make a choice for us. However, we can break this up to make MCTS more effective. This is the factored actions approach. First we decide whether we go vertical or horizontal by calling MC_support.choose(2), and next, we decide whether to move toward or away from the Exit. Intuitively, we can guess that moving toward the Exit more often than not is a good strategy. With this in mind, we call MC_support.choose(2, new Int[2] {1,2}). This will result in MC_support making a weighted choice using SoftMax and favoring 1 over 0. 
+
+We want to be able to play many games in as short a time as possible, so we need to disable the game’s various deliberate time delays or set them to zero. This can be done in the scripts or on the prefabs. In the MovingObject script, we can check for the manualPlay status and instantly move the object to the new position instead of performing a smooth move coroutine. 
+The exact changes we made to the game to integrate it with our tool are provided below. Admittedly, this is not the most elegant way it could be done. Still, it is under 100 lines of code, including support for flat and factored actions. 
+
+Add the MC_support script to the project’s Assets/Scripts folder. 
+
+Changes to GameManager.cs
+
+Add the following properties:    
+                    
+public bool manualPlay = true;
+public MC_support mcSupport;
+public const int FLAT_ACTIONS = 0;
+public const int FACTORED_ACTIONS = 1;
+public int designVariant = -1;
+private bool needFoodReset = false;
+public int rewardScore = 0;
+private int realRewardScore = 0;
+
+Adding the following in the Awake() method: 
+
+if (!manualPlay) {
+     if (mcSupport.IsDriverPresent) { 
+           mcSupport.Connect();
+           designVariant = GetPlayerModel(mcSupport.DesignVariant);
+     }
+     else {
+           mcSupport.Connect("localhost", 8000, "kitty");
+     }
+     Application.runInBackground = true;
+     Application.targetFrameRate = -1;
+     QualitySettings.vSyncCount = 0;
+}
+
+New helper methods:
+
+public void AddReward(int points) {
+     realRewardScore += points;
+}
+
+private int GetPlayerModel(string variant) {
+     switch (variant) {
+         case "factored_actions":
+             return FACTORED_ACTIONS;
+         default:
+              return FLAT_ACTIONS;
+     }
+}
+
+private int GetScore() {
+    return instance.realRewardScore;
+}
+
+private void ResetGame() {
+    boardScript.ready = false;
+    level = 0;
+    instance.realRewardScore = 0;
+    needFoodReset = true;
+     SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex, LoadSceneMode.Single);
+}
+
+At the end of the InitGame() method, add:
+
+if (needFoodReset) {
+     playerFoodPoints = 100;
+     needFoodReset = false;
+     instance.rewardScore = instance.realRewardScore;
+}
+
+Add the following at the beginning of the GameOver() method:
+
+if (!manualPlay) {
+   mcSupport.SupplyOutcome(GetScore());
+   ResetGame();
+}
+else <the rest of the original GameOver() code>
+
+Changes to Player.cs
+
+Add the following properties:
+
+private int fieldXcoord = 1;
+private int fieldYcoord = 1;      
+
+In the Update() method, under the line #if UNITTY_STANDALONE...
+Add the following:
+
+            if (!GameManager.instance.manualPlay) {
+                try {
+                    if (GameManager.instance.designVariant == GameManager.FLAT_ACTIONS) {
+                        switch(GameManager.instance.mcSupport.Select(4)) {
+                            case 0: //left
+                                horizontal = -1;
+                                break;
+                            case 1: //right
+                                horizontal = 1;
+                                break;
+                            case 2: //down
+                                vertical = -1;
+                                break;
+                            default: //up
+                                vertical = 1;
+                                break;
+                        }
+                    }
+                    else if (GameManager.instance.designVariant == GameManager.FACTORED_ACTIONS) {
+                        switch(GameManager.instance.mcSupport.Select(2)) {
+                            case 0: //moving horizontally
+                                horizontal = 1;
+                                break;
+                            default: //moving vertically
+                                vertical = 1;
+                                break;
+                        }
+                        switch(GameManager.instance.mcSupport.Select(2, new int[2] {1,2}))  {
+                            case 0: //moving left or down
+                                horizontal *= -1;
+                                vertical *= -1;
+                                break;
+                            default: //moving right or up
+                                break;
+                        }
+                    }   
+                }
+                catch (MC_support.ExperimentFinishedException e) {
+                    Application.Quit();
+                }
+            }
+	else {<everything before #elif>}
+
+At the end of the Restart() method, add
+
+fieldXcoord = 1;
+fieldYcoord = 1;
+
+In CheckIfGameOver (), add the following above GameManager.instance.GameOver():
+
+GameManager.instance.AddReward(GetDistance());
+
+Add this helper method:
+        //returns distance traveled toward the exit - a good thing. 
+        private int GetDistance() {
+            int distance = fieldXcoord + fieldYcoord;
+            return distance;
+        }
+
+Changes to MovingObject.cs
+
+Inside the Move() method, replace the if(hit.transform == null){...} contents with the following:
+
+if(hit.transform == null) {
+       if (GameManager.instance.manualPlay)
+            StartCoroutine(SmoothMovement(end));
+       else
+             rb2D.MovePosition(end);
+        return true;
+}
+
+In Prefabs:
+
+Set the Enemy1 and Enemy2 MoveTime (in the Enemy script component) to 0.
+
+Add the MC_support script as a component to the GameManager prefab. Drag and drop the MC_support script into the MC Support slot in the GameManager script component. Set Manual Play to false. Set Level Start Delay, Turn Delay and Reward Score to 0.
+
+In the Player prefab, Player script component, set Move Time and Restart Level Delay  to 0.
+
+Optional: mute the audio sources in the SoundManager prefab. 
